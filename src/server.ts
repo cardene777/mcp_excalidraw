@@ -1046,12 +1046,36 @@ app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
 });
 
 // Start server
-const PORT = parseInt(process.env.PORT || '3000', 10);
+const PORT = parseInt(process.env.PORT || '0', 10);
 const HOST = process.env.HOST || 'localhost';
 
 server.listen(PORT, HOST, () => {
-  logger.info(`POC server running on http://${HOST}:${PORT}`);
-  logger.info(`WebSocket server running on ws://${HOST}:${PORT}`);
+  const addr = server.address();
+  const actualPort = typeof addr === 'object' && addr ? addr.port : PORT;
+  logger.info(`POC server running on http://${HOST}:${actualPort}`);
+  logger.info(`WebSocket server running on ws://${HOST}:${actualPort}`);
+
+  // Notify parent process of the actual port via IPC
+  if (process.send) {
+    process.send({ type: 'canvas-port', port: actualPort });
+  }
 });
+
+// Graceful shutdown when parent process disconnects
+if (process.send) {
+  process.on('disconnect', () => {
+    logger.info('Parent process disconnected, shutting down canvas server');
+    server.close();
+    process.exit(0);
+  });
+
+  process.on('message', (msg: any) => {
+    if (msg && msg.type === 'shutdown') {
+      logger.info('Received shutdown request from parent');
+      server.close();
+      process.exit(0);
+    }
+  });
+}
 
 export default app;

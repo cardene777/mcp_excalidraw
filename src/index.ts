@@ -7,6 +7,7 @@ process.env.NO_COLOR = '1';
 import { fileURLToPath } from "url";
 import { deflateSync } from 'zlib';
 import { webcrypto } from 'crypto';
+import { fork, ChildProcess } from 'child_process';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { 
@@ -48,7 +49,8 @@ function sanitizeFilePath(filePath: string): string {
 }
 
 // Express server configuration
-const EXPRESS_SERVER_URL = process.env.EXPRESS_SERVER_URL || 'http://localhost:3000';
+let EXPRESS_SERVER_URL = process.env.EXPRESS_SERVER_URL || '';
+const SHOULD_AUTO_START_CANVAS = !process.env.EXPRESS_SERVER_URL;
 const ENABLE_CANVAS_SYNC = process.env.ENABLE_CANVAS_SYNC !== 'false'; // Default to true
 
 // API Response types
@@ -68,8 +70,8 @@ interface SyncResponse {
 
 // Helper functions to sync with Express server (canvas)
 async function syncToCanvas(operation: string, data: any): Promise<SyncResponse | null> {
-  if (!ENABLE_CANVAS_SYNC) {
-    logger.debug('Canvas sync disabled, skipping');
+  if (!ENABLE_CANVAS_SYNC || !EXPRESS_SERVER_URL) {
+    logger.debug('Canvas sync disabled or URL not set, skipping');
     return null;
   }
 
@@ -162,8 +164,8 @@ async function batchCreateElementsOnCanvas(elementsData: ServerElement[]): Promi
 
 // Helper to fetch element from canvas
 async function getElementFromCanvas(elementId: string): Promise<ServerElement | null> {
-  if (!ENABLE_CANVAS_SYNC) {
-    logger.debug('Canvas sync disabled, skipping fetch');
+  if (!ENABLE_CANVAS_SYNC || !EXPRESS_SERVER_URL) {
+    logger.debug('Canvas sync disabled or URL not set, skipping fetch');
     return null;
   }
 
@@ -2188,10 +2190,96 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return { tools };
 });
 
+// Canvas server child process management
+let canvasProcess: ChildProcess | null = null;
+
+async function startCanvasServer(): Promise<string | null> {
+  const serverScript = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    'server.js'
+  );
+
+  if (!fs.existsSync(serverScript)) {
+    logger.warn(`Canvas server script not found: ${serverScript}`);
+    return null;
+  }
+
+  return new Promise<string | null>((resolve) => {
+    const timeout = setTimeout(() => {
+      logger.warn('Canvas server startup timed out (10s)');
+      resolve(null);
+    }, 10000);
+
+    const child = fork(serverScript, [], {
+      stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
+      env: { ...process.env, PORT: '0' },
+    });
+
+    child.on('message', (msg: any) => {
+      if (msg && msg.type === 'canvas-port') {
+        clearTimeout(timeout);
+        const url = `http://localhost:${msg.port}`;
+        logger.info(`Canvas server auto-started at: ${url}`);
+        canvasProcess = child;
+        resolve(url);
+      }
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timeout);
+      logger.error('Canvas server failed to start:', err);
+      resolve(null);
+    });
+
+    child.on('exit', (code) => {
+      if (canvasProcess === child) {
+        canvasProcess = null;
+        logger.info(`Canvas server exited with code ${code}`);
+      }
+    });
+
+    // Suppress child stdout/stderr to avoid breaking MCP stdio
+    child.stdout?.on('data', () => {});
+    child.stderr?.on('data', (data: Buffer) => {
+      logger.debug(`Canvas server stderr: ${data.toString().trim()}`);
+    });
+  });
+}
+
+function stopCanvasServer(): void {
+  if (!canvasProcess) return;
+  const child = canvasProcess;
+  canvasProcess = null;
+
+  try {
+    child.send({ type: 'shutdown' });
+  } catch {
+    // IPC channel may already be closed
+  }
+
+  setTimeout(() => {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      // Process may already be gone
+    }
+  }, 3000);
+}
+
 // Start server
 async function runServer(): Promise<void> {
   try {
     logger.info('Starting Excalidraw MCP server...');
+
+    // Auto-start canvas server if EXPRESS_SERVER_URL is not set
+    if (SHOULD_AUTO_START_CANVAS && ENABLE_CANVAS_SYNC) {
+      const url = await startCanvasServer();
+      if (url) {
+        EXPRESS_SERVER_URL = url;
+      } else {
+        logger.warn('Canvas server auto-start failed; canvas features will be unavailable');
+      }
+    }
 
     const transport = new StdioServerTransport();
     logger.debug('Connecting to stdio transport...');
@@ -2210,6 +2298,7 @@ async function runServer(): Promise<void> {
 // Add global error handlers
 process.on('uncaughtException', (error: Error) => {
   logger.error('Uncaught exception:', error);
+  stopCanvasServer();
   process.stderr.write(`UNCAUGHT EXCEPTION: ${error.message}\n${error.stack}\n`);
   setTimeout(() => process.exit(1), 1000);
 });
@@ -2219,6 +2308,11 @@ process.on('unhandledRejection', (reason: any, promise: Promise<any>) => {
   process.stderr.write(`UNHANDLED REJECTION: ${reason}\n`);
   setTimeout(() => process.exit(1), 1000);
 });
+
+// Cleanup canvas server on exit
+process.on('exit', () => stopCanvasServer());
+process.on('SIGINT', () => { stopCanvasServer(); process.exit(0); });
+process.on('SIGTERM', () => { stopCanvasServer(); process.exit(0); });
 
 // For testing and debugging purposes
 if (process.env.DEBUG === 'true') {
